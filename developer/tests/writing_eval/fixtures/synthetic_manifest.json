@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "synthetic": true,
+  "dataNotice": "仅用于测试框架，分数不代表真实水平。Framework test data only: the essays are short texts written for this repository and the bands are invented; they do not represent real IELTS writing levels.",
+  "samples": [
+    {"id": "syn-t1-a", "taskType": "task1", "essayRef": "essays/syn-t1-a.txt", "source": "synthetic", "reference": {"taskResponse": 6.5, "coherence": 6.5, "lexical": 6.0, "grammar": 6.5}},
+    {"id": "syn-t1-b", "taskType": "task1", "essayRef": "essays/syn-t1-b.txt", "source": "synthetic", "reference": {"taskResponse": 4.0, "coherence": 4.5, "lexical": 4.0, "grammar": 4.0}},
+    {"id": "syn-t2-a", "taskType": "task2", "essayRef": "essays/syn-t2-a.txt", "source": "synthetic", "reference": {"taskResponse": 4.0, "coherence": 4.5, "lexical": 4.5, "grammar": 4.0}},
+    {"id": "syn-t2-b", "taskType": "task2", "essayRef": "essays/syn-t2-b.txt", "source": "synthetic", "reference": {"taskResponse": 5.5, "coherence": 6.0, "lexical": 5.5, "grammar": 6.0}},
+    {"id": "syn-t2-c", "taskType": "task2", "essayRef": "essays/syn-t2-c.txt", "source": "synthetic", "reference": {"taskResponse": 7.5, "coherence": 7.0, "lexical": 7.5, "grammar": 7.0}},
+    {"id": "syn-t2-d", "taskType": "task2", "essayRef": "essays/syn-t2-d.txt", "source": "synthetic", "reference": {"taskResponse": 8.0, "coherence": 8.0, "lexical": 8.5, "grammar": 8.0}},
+    {"id": "syn-t2-e", "taskType": "task2", "essayRef": "essays/syn-t2-e.txt", "source": "synthetic", "reference": {"taskResponse": 5.0, "coherence": 5.5, "lexical": 5.0, "grammar": 5.0}},
+    {"id": "syn-t2-f", "taskType": "task2", "essayRef": "essays/syn-t2-f.txt", "source": "synthetic", "reference": {"taskResponse": 7.0, "coherence": 7.0, "lexical": 7.0, "grammar": 6.5}}
+  ]
+}

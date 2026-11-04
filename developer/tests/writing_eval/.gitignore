@@ -1,0 +1,3 @@
+# Real sample sets and generated reports stay out of git.
+private/
+reports/
