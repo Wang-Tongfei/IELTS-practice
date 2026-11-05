@@ -453,6 +453,19 @@ def main() -> int:
             "Writing score confidence wording",
             ["node", "developer/tests/js/scoreConfidence.test.mjs"],
         ),
+        run_command(
+            "Writing eval harness (format, metrics, record/replay plumbing)",
+            [
+                sys.executable,
+                "-m",
+                "unittest",
+                "discover",
+                "-s",
+                "developer/tests/tools/writing-eval",
+                "-p",
+                "test_*.py",
+            ],
+        ),
     ]
     passed = all(check["status"] == "pass" for check in checks)
     report = {
