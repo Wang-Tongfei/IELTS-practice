@@ -1949,4 +1949,71 @@ mod tests {
     fn valid_score_with_invalid_feedback() -> String {
         r#"{"score":{"overall":7.0,"taskResponse":7.0,"coherence":6.5,"lexical":7.0,"grammar":6.5},"feedback":false}"#.into()
     }
+
+    /// Lets the offline evaluator (`developer/tests/tools/writing-eval`) use the
+    /// real scoring path: `WRITING_EVAL_HOOK=<in.json> WRITING_EVAL_HOOK_OUT=<out.json>
+    /// cargo test -p ielts-application --lib writing_eval_hook_when_asked`.
+    /// A no-op without the variables.
+    ///
+    /// Each input item is `{id, taskType, prompt, essay, replies?}`. The output
+    /// gives the exact scoring request `score_sample` sends with the built-in
+    /// rubric, and, when `replies` (raw model text, `null` for a failed call) are
+    /// given, what `collect_samples` + `aggregate_samples` make of them in order:
+    /// the final score, the capped samples, and `needsThird` when the first two
+    /// disagree and no third reply was recorded.
+    #[tokio::test]
+    async fn writing_eval_hook_when_asked() {
+        let (Some(input), Some(output)) = (
+            std::env::var_os("WRITING_EVAL_HOOK"),
+            std::env::var_os("WRITING_EVAL_HOOK_OUT"),
+        ) else {
+            return;
+        };
+        let items: Vec<serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(input).unwrap()).unwrap();
+        let mut results = Vec::new();
+        for item in &items {
+            let task_type = item["taskType"].as_str().and_then(WritingTaskType::parse_loose);
+            let mut prepared = prepared_evaluation(None);
+            prepared.task_type = task_type;
+            prepared.essay = item["essay"].as_str().unwrap_or_default().into();
+            prepared.prompt = item["prompt"].as_str().map(Into::into);
+            prepared.system_prompt = ielts_db::default_system_prompt(task_type);
+
+            let probe = ScriptedModel::new(vec![Err(ModelError::new("request dump", false))]);
+            let _ = score_sample(&probe, &prepared).await;
+            let request = probe.requests.lock().unwrap().remove(0);
+            let mut result = serde_json::json!({ "id": item["id"], "request": request });
+
+            if let Some(replies) = item["replies"].as_array() {
+                let mut script: Vec<Result<String, ModelError>> = replies
+                    .iter()
+                    .map(|reply| match reply.as_str() {
+                        Some(text) => Ok(text.to_string()),
+                        None => Err(ModelError::new("recorded failure", false)),
+                    })
+                    .collect();
+                // An unrecorded third call fails, so the first two stand.
+                script.resize_with(3, || Err(ModelError::new("not recorded", false)));
+                let model = ScriptedModel::new(script);
+                let replay = match collect_samples(&model, &prepared, &|| false).await {
+                    Ok(samples) => {
+                        let (score, diagnosis) = aggregate_samples(&samples).unwrap();
+                        let samples = samples.iter().map(|sample| &sample.score).collect::<Vec<_>>();
+                        let calls = model.requests.lock().unwrap().len();
+                        serde_json::json!({
+                            "final": score,
+                            "samples": samples,
+                            "ceilings": diagnosis.map(|d| d.ceilings).unwrap_or_default(),
+                            "needsThird": calls == 3 && replies.len() < 3,
+                        })
+                    }
+                    Err(error) => serde_json::json!({ "error": error.message }),
+                };
+                result["replay"] = replay;
+            }
+            results.push(result);
+        }
+        std::fs::write(output, serde_json::to_string_pretty(&results).unwrap()).unwrap();
+    }
 }

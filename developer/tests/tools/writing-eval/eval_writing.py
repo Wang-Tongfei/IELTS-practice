@@ -1,47 +1,66 @@
 #!/usr/bin/env python3
 """Offline accuracy and stability report for IELTS writing scores.
 
-Inputs (no network, no API key, no model calls):
+Without environment variables this never touches the network: it validates
+the manifest and runs, then reports. With an OpenAI-compatible endpoint
+configured, `--record` also scores the manifest's essays with a real model,
+using the application's real scoring request and its real post-call rules:
 
-  * a sample manifest: essay reference, task type and the known criterion
-    bands for each essay (see README.md for the schema);
-  * one or more JSONL files of recorded or fabricated model output: the
-    final scores a scoring configuration produced for those essays,
-    optionally with the individual scoring samples behind each score.
+    WRITING_EVAL_BASE_URL   e.g. https://api.openai.com/v1  (".../chat/completions" is appended)
+    WRITING_EVAL_API_KEY    bearer token
+    WRITING_EVAL_MODEL      model name
+
+The request (built-in rubric + output contract + measured facts) and the
+replay of raw replies (half-band snapping, ceilings, the second/third sample
+and the median) both come from the Rust crate through the test hook
+`writing_eval_hook_when_asked`, so this script needs cargo for `--record`
+and `--rescore`. Raw replies are saved, so `--rescore` can re-apply changed
+post-call rules to an old recording without paying for new calls.
+
+Inputs:
+
+  * a sample manifest: essay reference, task type, optional task prompt and
+    the known criterion bands for each essay (see README.md for the schema);
+  * one or more JSONL files of recorded or fabricated runs: the final scores
+    a scoring configuration produced, optionally with the individual scoring
+    samples and raw replies behind each score.
 
 Output: per scoring configuration, the error against the known bands for
 the four criteria and the overall band, the share within half a band, the
 shape of the predicted distribution (including how much lands on 6-6.5),
 and how consistent repeated evaluations of the same essay are.
 
-Every successful evaluation counts once. The metrics treat each evaluation
-as what a learner would have seen, so run every essay the same number of
-times when comparing configurations.
+Every successful evaluation counts once, so run every essay the same number
+of times when comparing configurations.
 
-Run with the bundled synthetic fixtures (framework smoke test only; their
-bands do not represent real writing levels):
+    # bundled synthetic fixtures (their bands do not represent real levels)
+    python developer/tests/tools/writing-eval/eval_writing.py
 
-    python developer/tests/writing_eval/run_writing_eval.py
-
-Run on a private sample set kept out of git:
-
-    python developer/tests/writing_eval/run_writing_eval.py \\
-        --manifest developer/tests/writing_eval/private/manifest.json \\
-        --runs developer/tests/writing_eval/private/runs.jsonl \\
-        --json-out developer/tests/writing_eval/reports/report.json
+    # record a real model on a private set, then report
+    python developer/tests/tools/writing-eval/eval_writing.py \\
+        --manifest developer/tests/tools/writing-eval/private/manifest.json \\
+        --record developer/tests/tools/writing-eval/private/runs-modelA.jsonl --repeats 2
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
+import os
+import subprocess
 import sys
+import tempfile
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from itertools import combinations
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 HERE = Path(__file__).resolve().parent
+ROOT = HERE.parents[3]
+ENV_KEYS = ("WRITING_EVAL_BASE_URL", "WRITING_EVAL_API_KEY", "WRITING_EVAL_MODEL")
 DEFAULT_MANIFEST = HERE / "fixtures" / "synthetic_manifest.json"
 DEFAULT_RUNS = HERE / "fixtures" / "synthetic_runs.jsonl"
 
@@ -76,6 +95,7 @@ class Sample:
     essay_ref: str
     reference: dict[str, float]
     source: str
+    task_prompt: str | None = None
 
 
 @dataclass
@@ -160,6 +180,8 @@ def parse_manifest(raw: Any) -> tuple[dict[str, Sample], dict[str, Any]]:
             issues.append(f"{where}: essayRef is required")
         if not isinstance(item.get("source"), str) or not item["source"]:
             issues.append(f"{where}: source is required (who wrote and who rated the essay)")
+        if item.get("taskPrompt") is not None and not isinstance(item["taskPrompt"], str):
+            issues.append(f"{where}: taskPrompt must be a string")
         reference_issues = _bands_issues(f"{where}.reference", item.get("reference"))
         issues.extend(reference_issues)
         if reference_issues:
@@ -176,6 +198,7 @@ def parse_manifest(raw: Any) -> tuple[dict[str, Sample], dict[str, Any]]:
             essay_ref=item["essayRef"],
             reference=reference,
             source=str(item.get("source", "")),
+            task_prompt=item.get("taskPrompt"),
         )
     if issues:
         raise EvalInputError(issues)
@@ -589,31 +612,262 @@ def render_markdown(report: dict[str, Any]) -> str:
 
 
 # --------------------------------------------------------------------------
+# Recording a real model (only with WRITING_EVAL_* set and --record)
+# --------------------------------------------------------------------------
+
+# Mirrors src-tauri/src/ai/runtime.rs: OUTPUT_LIMIT_RULES / apply_output_controls
+# (reasoning models take max_completion_tokens with a floor and no temperature)
+# and CACHE_ROUTING_RULES (the cache key goes only where the endpoint documents
+# a routing field). The coach evaluator sends temperature unconditionally,
+# which those models reject.
+REASONING_PREFIXES = ("o1", "o3", "o4", "gpt-5")
+REASONING_OUTPUT_FLOOR = 1024
+CACHE_ROUTING = (("api.openai.com", "prompt_cache_key"), ("openrouter.ai", "session_id"))
+RECORDING_NOTICE = (
+    "Recorded with a real model. Replies may quote the essays: keep this file out of git "
+    "(private/ is ignored) unless every essay is synthetic."
+)
+
+Hook = Callable[[list[dict[str, Any]]], list[dict[str, Any]]]
+Ask = Callable[[dict[str, Any]], "str | None"]
+
+
+def request_body(model: str, base_url: str, request: dict[str, Any]) -> dict[str, Any]:
+    """The chat-completions body the application's gateway would send."""
+    body: dict[str, Any] = {"model": model, "messages": request["messages"]}
+    name = model.rsplit("/", 1)[-1].lower()
+    if name.startswith(REASONING_PREFIXES):
+        body["max_completion_tokens"] = max(int(request["maxTokens"]), REASONING_OUTPUT_FLOOR)
+    else:
+        body["max_tokens"] = int(request["maxTokens"])
+        body["temperature"] = round(float(request["temperature"]), 4)
+    host = base_url.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0].lower()
+    key = request.get("cacheKey")
+    for suffix, field_name in CACHE_ROUTING:
+        if key and (host == suffix or host.endswith("." + suffix)):
+            body[field_name] = key
+    return body
+
+
+def http_ask(base_url: str, api_key: str, model: str) -> Ask:
+    """One chat completion per call; a failed call returns None, like a dropped sample."""
+
+    def ask(request: dict[str, Any]) -> str | None:
+        data = json.dumps(request_body(model, base_url, request)).encode()
+        http = urllib.request.Request(
+            base_url.rstrip("/") + "/chat/completions",
+            data=data,
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+        )
+        try:
+            with urllib.request.urlopen(http, timeout=180) as response:
+                return json.load(response)["choices"][0]["message"]["content"]
+        except (urllib.error.URLError, KeyError, IndexError, TypeError, ValueError, TimeoutError) as error:
+            print(f"request failed ({type(error).__name__}: {error})", file=sys.stderr)
+            return None
+
+    return ask
+
+
+def cargo_hook(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Runs `writing_eval_hook_when_asked` in ielts-application (see its doc comment)."""
+    environment = {name: value for name, value in os.environ.items() if name not in ENV_KEYS}
+    with tempfile.TemporaryDirectory() as scratch:
+        source, target = Path(scratch) / "in.json", Path(scratch) / "out.json"
+        source.write_text(json.dumps(items, ensure_ascii=False), encoding="utf-8")
+        environment.update({"WRITING_EVAL_HOOK": str(source), "WRITING_EVAL_HOOK_OUT": str(target)})
+        command = ["cargo", "test", "-q", "-p", "ielts-application", "--lib", "writing_eval_hook_when_asked"]
+        done = subprocess.run(
+            command, cwd=ROOT, env=environment, capture_output=True, text=True, encoding="utf-8", errors="replace"
+        )
+        if done.returncode != 0 or not target.is_file():
+            output = (done.stdout + done.stderr)[-800:]
+            raise EvalInputError([f"the writing_eval_hook_when_asked cargo test failed:\n{output}"])
+        return json.loads(target.read_text(encoding="utf-8"))
+
+
+def load_essays(samples: dict[str, Sample], base: Path) -> dict[str, str]:
+    missing = missing_essays(samples, base)
+    if missing:
+        raise EvalInputError([f"sample {sample_id}: essay file not found" for sample_id in missing])
+    return {sample.id: (base / sample.essay_ref).read_text(encoding="utf-8") for sample in samples.values()}
+
+
+def _hook_item(sample: Sample, essay: str, key: str, replies: list | None = None) -> dict[str, Any]:
+    item = {"id": key, "taskType": sample.task_type, "prompt": sample.task_prompt, "essay": essay}
+    if replies is not None:
+        item["replies"] = replies
+    return item
+
+
+def prompt_fingerprint(requests: Iterable[dict[str, Any]]) -> str:
+    """Hash of the system prompts actually sent, so a config names its rubric."""
+    systems = sorted({request["messages"][0]["content"] for request in requests})
+    return hashlib.sha256("\n\0\n".join(systems).encode()).hexdigest()[:12]
+
+
+def _run_record(sample_id: str, repeat: int, replay: dict[str, Any], replies: list, meta: dict[str, Any]) -> dict[str, Any]:
+    record: dict[str, Any] = {"sampleId": sample_id, **meta, "repeat": repeat}
+    if "error" in replay:
+        record["error"] = replay["error"]
+    else:
+        record.update(final=replay["final"], samples=replay["samples"], ceilings=replay["ceilings"])
+        if replay.get("needsThird"):
+            record["needsThird"] = True
+    record["replies"] = replies
+    return record
+
+
+def replay_all(
+    jobs: dict[str, tuple[Sample, int]],
+    replies: dict[str, list],
+    essays: dict[str, str],
+    hook: Hook,
+) -> dict[str, dict[str, Any]]:
+    items = [_hook_item(sample, essays[sample.id], key, replies[key]) for key, (sample, _) in jobs.items()]
+    return {item["id"]: item["replay"] for item in hook(items)} if items else {}
+
+
+def record_runs(
+    samples: dict[str, Sample],
+    essays: dict[str, str],
+    repeats: int,
+    ask: Ask,
+    hook: Hook,
+    model: str,
+    label: str | None = None,
+) -> list[dict[str, Any]]:
+    """Two scoring calls per evaluation, a third only where the application would make one."""
+    requests = {
+        item["id"]: item["request"]
+        for item in hook([_hook_item(sample, essays[sample.id], sample.id) for sample in samples.values()])
+    }
+    fingerprint = prompt_fingerprint(requests.values())
+    meta = {"config": label or f"{model}/{fingerprint}", "model": model, "promptFingerprint": fingerprint}
+    jobs = {f"{sample.id}#{repeat}": (sample, repeat) for repeat in range(repeats) for sample in samples.values()}
+    replies = {key: [ask(requests[sample.id]), ask(requests[sample.id])] for key, (sample, _) in jobs.items()}
+    replays = replay_all(jobs, replies, essays, hook)
+    third = {key: jobs[key] for key, replay in replays.items() if replay.get("needsThird")}
+    for key, (sample, _) in third.items():
+        replies[key].append(ask(requests[sample.id]))
+    replays.update(replay_all(third, replies, essays, hook))
+    return [_run_record(sample.id, repeat, replays[key], replies[key], meta) for key, (sample, repeat) in jobs.items()]
+
+
+def rescore_runs(
+    samples: dict[str, Sample],
+    essays: dict[str, str],
+    recorded: list[dict[str, Any]],
+    hook: Hook,
+    label: str | None = None,
+) -> list[dict[str, Any]]:
+    """Re-applies the current post-call rules to recorded raw replies; no network."""
+    issues = []
+    jobs: dict[str, tuple[Sample, int]] = {}
+    replies: dict[str, list] = {}
+    metas: dict[str, dict[str, Any]] = {}
+    for index, item in enumerate(recorded):
+        sample = samples.get(item.get("sampleId"))
+        if sample is None or not isinstance(item.get("replies"), list):
+            issues.append(f"recorded[{index}]: needs a manifest sampleId and the raw replies list")
+            continue
+        key = f"{index}"
+        jobs[key] = (sample, int(item.get("repeat", 0)))
+        replies[key] = item["replies"]
+        metas[key] = {name: item[name] for name in ("config", "model", "promptFingerprint") if name in item}
+        if label:
+            metas[key]["config"] = label
+    if issues:
+        raise EvalInputError(issues)
+    replays = replay_all(jobs, replies, essays, hook)
+    return [_run_record(sample.id, repeat, replays[key], replies[key], metas[key]) for key, (sample, repeat) in jobs.items()]
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    rows = []
+    for text in path.read_text(encoding="utf-8").splitlines():
+        if text.strip():
+            row = json.loads(text)
+            if isinstance(row, dict) and "_notice" not in row:
+                rows.append(row)
+    return rows
+
+
+def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [json.dumps({"_notice": RECORDING_NOTICE}, ensure_ascii=False)]
+    lines += [json.dumps(row, ensure_ascii=False) for row in rows]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _row_lines(rows: list[dict[str, Any]]) -> list[tuple[str, str]]:
+    return [(f"row {index}", json.dumps(row)) for index, row in enumerate(rows, 1)]
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--runs", type=Path, action="append", help="JSONL of recorded scores; repeatable")
     parser.add_argument("--config", action="append", help="only report these configs; repeatable")
     parser.add_argument("--json-out", type=Path)
     parser.add_argument("--markdown-out", type=Path)
     parser.add_argument("--check-essays", action="store_true", help="fail when an essayRef is not a file next to the manifest")
-    args = parser.parse_args(argv)
-    run_paths = args.runs or [DEFAULT_RUNS]
+    parser.add_argument("--validate-only", action="store_true", help="check the manifest and runs and stop, even if the endpoint variables are set")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--record", type=Path, metavar="OUT", help="score the manifest with the WRITING_EVAL_* model and write the runs here")
+    mode.add_argument("--rescore", type=Path, metavar="RECORDED", help="re-apply the current rules to recorded raw replies (no network)")
+    parser.add_argument("--out", type=Path, help="where --rescore writes its runs")
+    parser.add_argument("--repeats", type=int, default=2, help="evaluations per essay for --record (default 2)")
+    parser.add_argument("--label", help="config name for --record/--rescore (default: <model>/<prompt fingerprint>)")
+    return parser
+
+
+def _produce_runs(args: argparse.Namespace, samples: dict[str, Sample]) -> list[Run]:
+    if not (args.record or args.rescore):
+        return load_runs(args.runs or [DEFAULT_RUNS], samples)
+    essays = load_essays(samples, args.manifest.parent)
+    if args.record:
+        if args.repeats < 1:
+            raise EvalInputError(["--repeats must be at least 1"])
+        if not all(os.environ.get(name) for name in ENV_KEYS):
+            raise EvalInputError([f"--record needs {', '.join(ENV_KEYS)}"])
+        base_url, api_key, model = (os.environ[name] for name in ENV_KEYS)
+        calls = len(samples) * args.repeats
+        print(f"recording {calls} evaluations ({2 * calls}+ scoring calls) with {model}", file=sys.stderr)
+        rows = record_runs(samples, essays, args.repeats, http_ask(base_url, api_key, model), cargo_hook, model, args.label)
+        out = args.record
+    else:
+        if not args.out:
+            raise EvalInputError(["--rescore needs --out"])
+        rows = rescore_runs(samples, essays, read_jsonl(args.rescore), cargo_hook, args.label)
+        out = args.out
+    write_jsonl(out, rows)
+    print(f"wrote {len(rows)} runs to {out}", file=sys.stderr)
+    return parse_runs(_row_lines(rows), samples)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
     try:
         samples, meta = load_manifest(args.manifest)
         if args.check_essays:
-            missing = missing_essays(samples, args.manifest.parent)
-            if missing:
-                raise EvalInputError([f"sample {sample_id}: essay file not found" for sample_id in missing])
-        runs = load_runs(run_paths, samples)
+            load_essays(samples, args.manifest.parent)
+        if args.validate_only:
+            runs = load_runs(args.runs or [DEFAULT_RUNS], samples)
+            print(f"writing eval inputs ok: {len(samples)} essays, {len(runs)} runs")
+            return 0
+        runs = _produce_runs(args, samples)
         report = build_report(samples, runs, meta, args.config)
     except EvalInputError as error:
         print("writing eval input error:\n" + str(error), file=sys.stderr)
         return 2
+    if not (args.record or args.rescore):
+        print(f"live recording skipped: set {', '.join(ENV_KEYS)} and pass --record to score a real model", file=sys.stderr)
     markdown = render_markdown(report)
     for path, text in ((args.json_out, json.dumps(report, ensure_ascii=False, indent=2) + "\n"), (args.markdown_out, markdown)):
         if path:

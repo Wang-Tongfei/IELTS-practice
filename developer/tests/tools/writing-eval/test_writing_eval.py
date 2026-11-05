@@ -6,6 +6,7 @@ import contextlib
 import io
 import json
 import math
+import os
 import sys
 import tempfile
 import unittest
@@ -14,7 +15,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-import run_writing_eval as ev  # noqa: E402
+import eval_writing as ev  # noqa: E402
 
 
 def bands(tr, cc, lr, gra):
@@ -278,11 +279,188 @@ class FixtureTest(unittest.TestCase):
         self.assertIn("reports/", ignored)
 
 
+class RequestBodyTest(unittest.TestCase):
+    REQUEST = {
+        "messages": [{"role": "system", "content": "rubric"}, {"role": "user", "content": "essay"}],
+        "temperature": 0.30000001192092896,
+        "maxTokens": 2048,
+        "cacheKey": "writing-eval-abc",
+    }
+
+    def test_ordinary_models_get_temperature_and_max_tokens(self):
+        body = ev.request_body("deepseek-chat", "https://api.deepseek.com/v1", self.REQUEST)
+        self.assertEqual(body["temperature"], 0.3)
+        self.assertEqual(body["max_tokens"], 2048)
+        self.assertNotIn("max_completion_tokens", body)
+        self.assertNotIn("prompt_cache_key", body)
+        self.assertNotIn("session_id", body)
+
+    def test_reasoning_models_get_no_temperature_and_a_floor(self):
+        for model in ("gpt-5-mini", "openai/o3-mini", "O1"):
+            body = ev.request_body(model, "https://example.test/v1", {**self.REQUEST, "maxTokens": 512})
+            self.assertNotIn("temperature", body, model)
+            self.assertNotIn("max_tokens", body, model)
+            self.assertEqual(body["max_completion_tokens"], 1024, model)
+
+    def test_cache_key_goes_only_to_documented_hosts(self):
+        openai = ev.request_body("gpt-4.1", "https://api.openai.com/v1", self.REQUEST)
+        self.assertEqual(openai["prompt_cache_key"], "writing-eval-abc")
+        router = ev.request_body("x/y", "https://eu.openrouter.ai:443/api/v1", self.REQUEST)
+        self.assertEqual(router["session_id"], "writing-eval-abc")
+        lookalike = ev.request_body("x", "https://notopenrouter.ai/v1", self.REQUEST)
+        self.assertNotIn("session_id", lookalike)
+
+
+def fake_hook(calls):
+    """Stands in for the cargo hook: request = essay echo; replay = first parsed band."""
+
+    def hook(items):
+        calls.append(items)
+        out = []
+        for item in items:
+            request = {
+                "messages": [
+                    {"role": "system", "content": f"rubric-{item['taskType']}"},
+                    {"role": "user", "content": item["essay"]},
+                ],
+                "temperature": 0.3,
+                "maxTokens": 2048,
+            }
+            result = {"id": item["id"], "request": request}
+            if "replies" in item:
+                parsed = [json.loads(reply) for reply in item["replies"] if reply]
+                if not parsed:
+                    result["replay"] = {"error": "recorded failure"}
+                else:
+                    tr = [p["tr"] for p in parsed]
+                    far = len(tr) == 2 and abs(tr[0] - tr[1]) >= 1
+                    final = sorted(tr)[len(tr) // 2] if len(tr) == 3 else tr[0]
+                    result["replay"] = {
+                        "final": bands(final, 6, 6, 6),
+                        "samples": [bands(value, 6, 6, 6) for value in tr],
+                        "ceilings": [],
+                        "needsThird": far and len(item["replies"]) < 3,
+                    }
+            out.append(result)
+        return out
+
+    return hook
+
+
+class RecordTest(unittest.TestCase):
+    def setUp(self):
+        self.samples, _ = ev.parse_manifest(
+            manifest(sample("near", bands(6, 6, 6, 6)), sample("far", bands(6, 6, 6, 6)), sample("down", bands(6, 6, 6, 6)))
+        )
+        self.essays = {"near": "near essay", "far": "far essay", "down": "down essay"}
+        self.asked = []
+
+    def ask(self, request):
+        essay = request["messages"][1]["content"]
+        self.asked.append(essay)
+        if essay == "down essay":
+            return None
+        if essay == "far essay":
+            return json.dumps({"tr": [5, 7, 6.5][min(self.asked.count(essay) - 1, 2)]})
+        return json.dumps({"tr": 6})
+
+    def test_two_calls_per_evaluation_and_a_third_only_on_disagreement(self):
+        hook_calls = []
+        rows = ev.record_runs(self.samples, self.essays, 1, self.ask, fake_hook(hook_calls), "m1")
+        self.assertEqual(self.asked.count("near essay"), 2)
+        self.assertEqual(self.asked.count("far essay"), 3)
+        self.assertEqual(self.asked.count("down essay"), 2)
+        # one request dump, one replay of everything, one replay of the third-call essays
+        self.assertEqual([len(items) for items in hook_calls], [3, 3, 1])
+        by_id = {row["sampleId"]: row for row in rows}
+        self.assertEqual(by_id["far"]["final"]["taskResponse"], 6.5)
+        self.assertEqual(len(by_id["far"]["replies"]), 3)
+        self.assertNotIn("needsThird", by_id["far"])
+        self.assertEqual(by_id["down"]["error"], "recorded failure")
+        self.assertNotIn("final", by_id["down"])
+        self.assertEqual(by_id["down"]["replies"], [None, None])
+        config = by_id["near"]["config"]
+        self.assertTrue(config.startswith("m1/") and len(config) == len("m1/") + 12, config)
+        self.assertEqual(by_id["near"]["promptFingerprint"], config.split("/")[1])
+        runs = ev.parse_runs(ev._row_lines(rows), self.samples)
+        self.assertEqual(sum(run.final is None for run in runs), 1)
+
+    def test_repeats_and_label(self):
+        rows = ev.record_runs(self.samples, self.essays, 2, self.ask, fake_hook([]), "m1", label="baseline")
+        self.assertEqual(sorted((row["sampleId"], row["repeat"]) for row in rows)[:2], [("down", 0), ("down", 1)])
+        self.assertEqual({row["config"] for row in rows}, {"baseline"})
+
+    def test_rescore_replays_recorded_replies_without_asking(self):
+        rows = ev.record_runs(self.samples, self.essays, 1, self.ask, fake_hook([]), "m1")
+        asked = len(self.asked)
+        hook_calls = []
+        again = ev.rescore_runs(self.samples, self.essays, rows, fake_hook(hook_calls), label="rules-v2")
+        self.assertEqual(len(self.asked), asked)
+        self.assertEqual([len(items) for items in hook_calls], [3])
+        self.assertEqual({row["config"] for row in again}, {"rules-v2"})
+        self.assertEqual([row.get("final") for row in again], [row.get("final") for row in rows])
+        with self.assertRaises(ev.EvalInputError):
+            ev.rescore_runs(self.samples, self.essays, [{"sampleId": "near"}], fake_hook([]))
+
+    def test_recordings_carry_a_notice_and_read_back(self):
+        rows = ev.record_runs(self.samples, self.essays, 1, self.ask, fake_hook([]), "m1")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "nested" / "runs.jsonl"
+            ev.write_jsonl(path, rows)
+            self.assertIn("keep this file out of git", path.read_text(encoding="utf-8").splitlines()[0])
+            self.assertEqual(ev.read_jsonl(path), rows)
+            self.assertEqual(len(ev.load_runs([path], self.samples)), 3)
+
+    def test_prompt_fingerprint_follows_the_system_prompts_only(self):
+        one = [{"messages": [{"content": "a"}, {"content": "x"}]}, {"messages": [{"content": "b"}, {"content": "y"}]}]
+        same = [{"messages": [{"content": "b"}, {"content": "z"}]}, {"messages": [{"content": "a"}, {"content": "w"}]}]
+        other = [{"messages": [{"content": "a2"}, {"content": "x"}]}]
+        self.assertEqual(ev.prompt_fingerprint(one), ev.prompt_fingerprint(same))
+        self.assertNotEqual(ev.prompt_fingerprint(one), ev.prompt_fingerprint(other))
+
+    def test_manifest_task_prompt_must_be_text(self):
+        with self.assertRaises(ev.EvalInputError):
+            ev.parse_manifest(manifest({**sample("a", bands(6, 6, 6, 6)), "taskPrompt": 3}))
+        samples, _ = ev.parse_manifest(manifest({**sample("a", bands(6, 6, 6, 6)), "taskPrompt": "Discuss."}))
+        self.assertEqual(samples["a"].task_prompt, "Discuss.")
+
+
 class CliTest(unittest.TestCase):
+    def run_main(self, *argv, env=None):
+        out, err = io.StringIO(), io.StringIO()
+        saved = {name: os.environ.pop(name) for name in ev.ENV_KEYS if name in os.environ}
+        try:
+            os.environ.update(env or {})
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = ev.main(list(argv))
+        finally:
+            for name in ev.ENV_KEYS:
+                os.environ.pop(name, None)
+            os.environ.update(saved)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_validate_only_never_records(self):
+        code, out, _ = self.run_main("--validate-only", "--check-essays", env={name: "x" for name in ev.ENV_KEYS})
+        self.assertEqual(code, 0)
+        self.assertIn("writing eval inputs ok: 8 essays", out)
+
+    def test_record_and_rescore_need_their_inputs(self):
+        code, _, err = self.run_main("--record", "unused.jsonl")
+        self.assertEqual(code, 2)
+        self.assertIn("--record needs WRITING_EVAL_BASE_URL", err)
+        code, _, err = self.run_main("--rescore", str(ev.DEFAULT_RUNS))
+        self.assertEqual(code, 2)
+        self.assertIn("--rescore needs --out", err)
+
+    def test_default_run_says_how_to_record(self):
+        code, _, err = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertIn("live recording skipped", err)
+
     def test_fixture_replay_writes_reports_and_tells_configs_apart(self):
         with tempfile.TemporaryDirectory() as tmp:
             json_out, markdown_out = Path(tmp) / "r.json", Path(tmp) / "r.md"
-            with contextlib.redirect_stdout(io.StringIO()):
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 code = ev.main(["--check-essays", "--json-out", str(json_out), "--markdown-out", str(markdown_out)])
             self.assertEqual(code, 0)
             report = json.loads(json_out.read_text(encoding="utf-8"))

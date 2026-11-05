@@ -454,14 +454,14 @@ def main() -> int:
             ["node", "developer/tests/js/scoreConfidence.test.mjs"],
         ),
         run_command(
-            "Writing scoring eval harness (offline replay)",
+            "Writing eval harness (format, metrics, record/replay plumbing)",
             [
                 sys.executable,
                 "-m",
                 "unittest",
                 "discover",
                 "-s",
-                "developer/tests/writing_eval",
+                "developer/tests/tools/writing-eval",
                 "-p",
                 "test_*.py",
             ],
